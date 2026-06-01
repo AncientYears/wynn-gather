@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gathering Spots Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; }
+#map-wrap { position: relative; width: 100%; height: 100%; }
+#map { width: 100%; height: 100%; }
+#dot-canvas {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  pointer-events: none; z-index: 500;
+}
+#panel {
+  position: fixed; top: 10px; right: 10px; z-index: 1000;
+  background: rgba(30,30,50,0.95); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  width: 230px; max-height: calc(100vh - 40px); display: flex; flex-direction: column;
+  color: #e0e0e0; font-size: 13px;
+}
+#panel-header { padding: 14px 16px 8px; border-bottom: 1px solid rgba(255,255,255,0.1); flex-shrink: 0; }
+#panel-header h2 { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 2px; }
+#panel-header .subtitle { font-size: 11px; color: #888; }
+#search-box { margin: 8px 14px; padding: 6px 10px; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; font-size: 12px; background: rgba(0,0,0,0.3); color: #e0e0e0; outline: none; flex-shrink: 0; }
+#search-box:focus { border-color: #4a90d9; }
+#search-box::placeholder { color: #666; }
+#filter-list { overflow-y: auto; padding: 4px 14px 10px; flex: 1; }
+.filter-item { display: flex; align-items: center; padding: 3px 0; cursor: pointer; gap: 6px; user-select: none; }
+.filter-item input { margin: 0; cursor: pointer; flex-shrink: 0; accent-color: #4a90d9; }
+.filter-item .color-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.15); }
+.filter-item .name { flex: 1; color: #ccc; }
+.filter-item .count { color: #666; font-size: 10px; }
+#toggle-all { padding: 6px 0; font-size: 11px; color: #4a90d9; cursor: pointer; text-align: center; border-top: 1px solid rgba(255,255,255,0.08); flex-shrink: 0; }
+#toggle-all:hover { background: rgba(74,144,217,0.1); }
+#mode-toggle { padding: 6px 0; font-size: 11px; color: #f39c12; cursor: pointer; text-align: center; border-top: 1px solid rgba(255,255,255,0.08); flex-shrink: 0; }
+#mode-toggle:hover { background: rgba(243,156,18,0.1); }
+#tooltip {
+  position: fixed; z-index: 10000; pointer-events: auto;
+  background: rgba(20,20,40,0.95); color: #e0e0e0; padding: 8px 12px;
+  border-radius: 6px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  border: 1px solid rgba(255,255,255,0.1); display: none; line-height: 1.5; max-width: 250px;
+  cursor: pointer; user-select: text;
+}
+#tooltip .tt-name { font-weight: 600; color: #fff; }
+#tooltip .tt-detail { color: #999; font-size: 11px; }
+.leaflet-control-zoom { border: none !important; box-shadow: 0 2px 12px rgba(0,0,0,0.3) !important; }
+.leaflet-control-zoom a { border-radius: 4px !important; background: rgba(30,30,50,0.9) !important; color: #e0e0e0 !important; }
+.leaflet-container { background: #1a1a2e; }
+.leaflet-image-layer { image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<div id="map-wrap">
+  <div id="map"></div>
+  <canvas id="dot-canvas"></canvas>
+</div>
+<div id="panel">
+  <div id="panel-header">
+    <h2>Gathering Spots</h2>
+    <div class="subtitle" id="total-count"></div>
+  </div>
+  <input id="search-box" type="text" placeholder="Search resources..." />
+  <div id="filter-list"></div>
+  <div id="toggle-all">Toggle All</div>
+  <div id="mode-toggle">Switch to Individual Spots</div>
+</div>
+<div id="tooltip"></div>
+<script src="gatheringSpots.js"></script>
+<script>
+const IMG_W = 4608, IMG_H = 6644;
+
+// Transform: game (x,z) -> pixel coords on the image
+// Original formula (from working code on 3x scaled map):
+//   px = x/3 + 797.667
+//   py = z/3 + 2203
+// If dots are flipped or in wrong place, adjust SCALE and OFF below.
+const SCALE_X = 1, SCALE_Y = 1;
+const OFF_X = 2560, OFF_Y = 6636;
+
+// Returns [CRS_lng, CRS_lat] for Leaflet CRS.Simple
+// CRS lat increases UPWARD (opposite of pixel Y which increases downward)
+function gameToCRS(x, z) {
+  const px = x * SCALE_X + OFF_X;
+  const py = z * SCALE_Y + OFF_Y;
+  return [px, IMG_H - py];  // invert Y: pixel 0 (top) → CRS IMG_H (north)
+}
+
+console.log('Transform: px=x*'+SCALE_X+'+'+OFF_X+', py=z*'+SCALE_Y+'+'+OFF_Y);
+
+let _lastClusters = [];
+let _lastCellSize = 20;
+let _hoverThreshold = 10;
+let clusterMode = true;
+let _initialZoom = null;
+
+function buildClusters(spots, cellSize) {
+  const map = new Map();
+  for (let i = 0, len = spots.length; i < len; i++) {
+    const d = spots[i];
+    const cx = Math.floor(d.x / cellSize);
+    const cz = Math.floor(d.z / cellSize);
+    const key = cx + ',' + cz;
+    let c = map.get(key);
+    if (!c) {
+      c = { sx: 0, sz: 0, total: 0, resources: {}, _first: d };
+      map.set(key, c);
+    }
+    c.sx += d.x;
+    c.sz += d.z;
+    c.total++;
+    c.resources[d.resource] = (c.resources[d.resource] || 0) + 1;
+  }
+  return [...map.values()].map(function(c) {
+    c.x = c.sx / c.total;
+    c.z = c.sz / c.total;
+    delete c.sx;
+    delete c.sz;
+    return c;
+  });
+}
+
+const COLORS = {}, RESOURCE_DATA = {};
+const PALETTE = [
+  '#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#34495e',
+  '#e91e63','#00bcd4','#8bc34a','#ff9800','#673ab7','#009688','#ff5722','#607d8b',
+  '#f44336','#2196f3','#4caf50','#ffc107','#9c27b0','#00acc1','#cddc39','#ff6f00',
+  '#7b1fa2','#00897b','#bf360c','#455a64','#d32f2f','#1976d2','#388e3c','#f57c00',
+  '#512da8','#00695c','#e64a19','#546e7a','#c2185b','#1565c0','#2e7d32','#ef6c00',
+  '#4527a0','#004d40','#d84315','#37474f','#ad1457','#0d47a1','#1b5e20','#e65100',
+  '#311b92','#003300','#bf360c','#263238'
+];
+
+const resources = [...new Set(GATHERING_SPOTS.map(d => d.resource))].sort();
+resources.forEach((r, i) => {
+  COLORS[r] = PALETTE[i % PALETTE.length];
+  RESOURCE_DATA[r] = { count: 0, visible: true };
+});
+const counts = {};
+GATHERING_SPOTS.forEach(d => { counts[d.resource] = (counts[d.resource] || 0) + 1; });
+resources.forEach(r => { RESOURCE_DATA[r].count = counts[r]; });
+document.getElementById('total-count').textContent = `${GATHERING_SPOTS.length} spots, ${resources.length} resources`;
+
+// ---- Map ----
+const map = L.map('map', {
+  crs: L.CRS.Simple, minZoom: -3, maxZoom: 4,
+  zoomControl: true, attributionControl: false
+});
+const bounds = [[0, 0], [IMG_H, IMG_W]];
+L.imageOverlay('main-map.png', bounds).addTo(map);
+map.fitBounds(bounds);
+
+// ---- Canvas overlay ----
+const canvas = document.getElementById('dot-canvas');
+const ctx = canvas.getContext('2d');
+
+function drawDots() {
+  const container = map.getContainer();
+  const size = map.getSize();
+  if (!size || !size.x || !size.y) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = size.x * dpr;
+  canvas.height = size.y * dpr;
+  canvas.style.width = size.x + 'px';
+  canvas.style.height = size.y + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size.x, size.y);
+
+  const spots = GATHERING_SPOTS;
+  const visData = RESOURCE_DATA;
+
+  const visible = [];
+  for (let i = 0, len = spots.length; i < len; i++) {
+    if (visData[spots[i].resource].visible) visible.push(spots[i]);
+  }
+  if (visible.length === 0) return;
+
+  const zoom = map.getZoom();
+  if (_initialZoom === null) _initialZoom = zoom;
+  const relZoom = Math.round(zoom - _initialZoom);
+
+  if (clusterMode) {
+    _lastCellSize = Math.max(10, Math.round(70 / Math.pow(2, zoom)));
+
+    if (relZoom >= 4) {
+      // At high zoom, show individual spots instead of clusters
+      _lastClusters = visible.map(function(d) {
+        var o = {}; o[d.resource] = 1;
+        return { x: d.x, z: d.z, total: 1, _first: d, resources: o };
+      });
+      _hoverThreshold = 12;
+      for (let i = 0, len = visible.length; i < len; i++) {
+        const d = visible[i];
+        d._radius = Math.max(3, 3.5 * Math.pow(1.35, zoom));
+        const [clng, clat] = gameToCRS(d.x, d.z);
+        const point = map.latLngToContainerPoint([clat, clng]);
+        if (point.x < -10 || point.x > size.x + 10 || point.y < -10 || point.y > size.y + 10) continue;
+
+        const radius = d._radius;
+
+        if (zoom >= 0) {
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, radius + 3, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.06)';
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, radius + 1.5, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.1)';
+          ctx.fill();
+        }
+
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.globalAlpha = zoom >= 0 ? 0.7 : 0.5;
+        ctx.fillStyle = COLORS[d.resource] || '#ff00ff';
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        if (zoom >= 0) {
+          ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+      }
+    } else {
+      // Cluster mode at normal zoom
+      _lastClusters = buildClusters(visible, _lastCellSize);
+      _hoverThreshold = 15;
+
+      const clusterScale = relZoom <= 0 ? 0.5 : relZoom === 1 ? 0.75 : relZoom === 2 ? 1.0 : 1.25;
+      const minCluster = Math.max(2, Math.round(3 / Math.pow(1.5, Math.max(0, zoom))));
+
+      for (let i = 0, len = _lastClusters.length; i < len; i++) {
+        const c = _lastClusters[i];
+        const [clng, clat] = gameToCRS(c.x, c.z);
+        const point = map.latLngToContainerPoint([clat, clng]);
+        if (point.x < -50 || point.x > size.x + 50 || point.y < -50 || point.y > size.y + 50) continue;
+
+        // Bounds check in CRS space
+        const cxPixel = c.x * SCALE_X + OFF_X;
+        const czPixel = c.z * SCALE_Y + OFF_Y;
+        if (cxPixel < -20 || cxPixel > IMG_W + 20 || czPixel < -20 || czPixel > IMG_H + 20) continue;
+
+        let radius;
+        if (c.total < minCluster) {
+          // Too few in cell, draw small individual dot
+          radius = Math.max(3, 3.5 * Math.pow(1.35, zoom));
+          c._radius = radius;
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+          ctx.globalAlpha = 0.5;
+          ctx.fillStyle = COLORS[c._first.resource] || '#ff00ff';
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        } else {
+          radius = Math.min(35, Math.max(5, (Math.log(c.total + 1) * 6 + 6) * clusterScale));
+          c._radius = radius;
+
+          if (zoom >= 0) {
+            // White backing
+            ctx.beginPath();
+            ctx.arc(point.x, point.y, radius + 2, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255,255,255,0.2)';
+            ctx.fill();
+
+            // Glow
+            ctx.beginPath();
+            ctx.arc(point.x, point.y, radius + 4, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255,255,255,0.04)';
+            ctx.fill();
+          }
+
+          // Main circle (use most common resource color)
+          const topEntry = Object.entries(c.resources).sort(function(a,b){return b[1]-a[1];})[0];
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+          ctx.globalAlpha = zoom >= 0 ? 0.7 : 0.5;
+          ctx.fillStyle = COLORS[topEntry[0]] || '#ff00ff';
+          ctx.fill();
+          ctx.globalAlpha = 1;
+
+          if (zoom >= 0) {
+            ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          }
+
+          // Count label
+          const label = String(c.total);
+          ctx.fillStyle = '#fff';
+          ctx.font = 'bold ' + Math.max(9, Math.min(18, radius * 0.7)) + 'px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          // Dark outline for readability
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+          ctx.strokeText(label, point.x, point.y);
+          ctx.fillText(label, point.x, point.y);
+        }
+      }
+    }
+  } else {
+    // Individual spots mode
+    _lastCellSize = 1;
+    _lastClusters = visible.map(function(d) {
+      var o = {}; o[d.resource] = 1;
+      return { x: d.x, z: d.z, total: 1, _first: d, resources: o };
+    });
+    _hoverThreshold = 12;
+
+    for (let i = 0, len = visible.length; i < len; i++) {
+      const d = visible[i];
+      d._radius = Math.max(3, 3.5 * Math.pow(1.35, zoom));
+      const [clng, clat] = gameToCRS(d.x, d.z);
+      const point = map.latLngToContainerPoint([clat, clng]);
+      if (point.x < -10 || point.x > size.x + 10 || point.y < -10 || point.y > size.y + 10) continue;
+
+      const radius = Math.max(3, 3.5 * Math.pow(1.35, zoom));
+
+      if (zoom >= 0) {
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius + 3, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.06)';
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius + 1.5, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.1)';
+        ctx.fill();
+      }
+
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+      ctx.globalAlpha = zoom >= 0 ? 0.7 : 0.5;
+      ctx.fillStyle = COLORS[d.resource] || '#ff00ff';
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      if (zoom >= 0) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+  }
+}
+
+map.on('moveend resize', drawDots);
+setTimeout(drawDots, 300);
+
+// ---- Hover tooltip ----
+const tooltip = document.getElementById('tooltip');
+let hoverTimer = null;
+tooltip._pinned = false;
+
+function setTooltipContent(e, closest) {
+  tooltip.style.display = 'block';
+  tooltip.style.left = (e.containerPoint.x + 14) + 'px';
+  tooltip.style.top = (e.containerPoint.y - 10) + 'px';
+  if (closest.total === 1) {
+    const d = closest._first;
+    const [clng, clat] = gameToCRS(d.x, d.z);
+    tooltip.innerHTML = '<div class="tt-name">' + d.resource + ' <span style="color:#888;font-weight:400">Lv' + d.level + '</span></div><div class="tt-detail">Game: ' + d.x + ', ' + d.z + ' &middot; CRS: ' + clng.toFixed(0) + ', ' + clat.toFixed(0) + '</div>';
+  } else {
+    const entries = Object.entries(closest.resources).sort(function(a,b){return b[1]-a[1];});
+    const breakdown = entries.map(function(e){return '<span style="color:'+COLORS[e[0]]+'">●</span> '+e[0]+': '+e[1];}).join(' &middot; ');
+    tooltip.innerHTML = '<div class="tt-name">' + closest.total + ' spots</div><div class="tt-detail">' + breakdown + '</div>';
+  }
+}
+
+function findClusterAt(mousePoint) {
+  const clusters = _lastClusters;
+  let closest = null, minDist = Infinity;
+  for (let i = 0, len = clusters.length; i < len; i++) {
+    const c = clusters[i];
+    const [clng, clat] = gameToCRS(c.x, c.z);
+    const point = map.latLngToContainerPoint([clat, clng]);
+    const dx = point.x - mousePoint.x, dy = point.y - mousePoint.y;
+    const dist = dx * dx + dy * dy;
+    if (dist < minDist) { minDist = dist; closest = c; }
+  }
+  if (closest) {
+    const r = closest._radius !== undefined ? closest._radius :
+              (closest._first && closest._first._radius !== undefined ? closest._first._radius : null);
+    const threshold = r !== null ? r + 4 : _hoverThreshold;
+    if (Math.sqrt(minDist) < threshold) return closest;
+  }
+  return null;
+}
+
+map.on('mousemove', e => {
+  if (tooltip._pinned) return;
+  if (hoverTimer) return;
+  hoverTimer = setTimeout(() => { hoverTimer = null; }, 30);
+  const closest = findClusterAt(e.containerPoint);
+  if (closest) {
+    setTooltipContent(e, closest);
+  } else {
+    tooltip.style.display = 'none';
+  }
+});
+map.on('mouseout', () => { if (!tooltip._pinned) tooltip.style.display = 'none'; });
+
+map.on('click', e => {
+  if (e.originalEvent.shiftKey) return;
+  if (tooltip._pinned) {
+    tooltip._pinned = false;
+    tooltip.style.display = 'none';
+    return;
+  }
+  const closest = findClusterAt(e.containerPoint);
+  if (closest) {
+    setTooltipContent(e, closest);
+    tooltip._pinned = true;
+  }
+});
+
+// Shift+click to report pixel & game coords at that point
+map.on('click', e => {
+  if (!e.originalEvent.shiftKey) return;
+  const clng = e.latlng.lng, clat = e.latlng.lat;
+  const gx = (clng - OFF_X) / SCALE_X;
+  const gz = ((IMG_H - clat) - OFF_Y) / SCALE_Y;
+  alert(`CRS: (${clng.toFixed(1)}, ${clat.toFixed(1)})\nGame: (${gx.toFixed(1)}, ${gz.toFixed(1)})`);
+});
+
+// ---- Filter ----
+function buildFilterList(filterText) {
+  const container = document.getElementById('filter-list');
+  container.innerHTML = '';
+  const filtered = filterText ? resources.filter(r => r.toLowerCase().includes(filterText.toLowerCase())) : resources;
+  filtered.forEach(r => {
+    const d = RESOURCE_DATA[r];
+    const item = document.createElement('label');
+    item.className = 'filter-item';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = d.visible;
+    cb.addEventListener('change', () => { d.visible = cb.checked; drawDots(); });
+    const dot = document.createElement('span');
+    dot.className = 'color-dot'; dot.style.background = COLORS[r];
+    const name = document.createElement('span'); name.className = 'name'; name.textContent = r.charAt(0) + r.slice(1).toLowerCase();
+    const count = document.createElement('span'); count.className = 'count'; count.textContent = d.count;
+    item.append(cb, dot, name, count);
+    container.appendChild(item);
+  });
+}
+buildFilterList('');
+
+document.getElementById('search-box').addEventListener('input', e => buildFilterList(e.target.value));
+
+let allVisible = true;
+document.getElementById('toggle-all').addEventListener('click', () => {
+  allVisible = !allVisible;
+  resources.forEach(r => { RESOURCE_DATA[r].visible = allVisible; });
+  buildFilterList(document.getElementById('search-box').value);
+  drawDots();
+});
+
+document.getElementById('mode-toggle').addEventListener('click', () => {
+  clusterMode = !clusterMode;
+  document.getElementById('mode-toggle').textContent = clusterMode ? 'Switch to Individual Spots' : 'Switch to Clusters';
+  drawDots();
+});
+</script>
+</body>
+</html>
