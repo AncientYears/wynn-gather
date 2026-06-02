@@ -161,7 +161,7 @@ const map = L.map('map', {
   zoomControl: true, attributionControl: false
 });
 const bounds = [[0, 0], [IMG_H, IMG_W]];
-L.imageOverlay('main-map.png', bounds).addTo(map);
+L.imageOverlay('main-map.webp', bounds).addTo(map);
 map.fitBounds(bounds);
 
 // ---- Canvas overlay ----
@@ -200,7 +200,7 @@ function drawDots() {
       // At high zoom, show individual spots instead of clusters
       _lastClusters = visible.map(function(d) {
         var o = {}; o[d.resource] = 1;
-        return { x: d.x, z: d.z, total: 1, _first: d, resources: o, _crs: d._crs };
+        return { x: d.x, z: d.z, total: 1, _first: d, resources: o, _crs: d._crs, resource: d.resource };
       });
       _hoverThreshold = 12;
       for (let i = 0, len = _lastClusters.length; i < len; i++) {
@@ -319,7 +319,7 @@ function drawDots() {
     _lastCellSize = 1;
     _lastClusters = visible.map(function(d) {
       var o = {}; o[d.resource] = 1;
-      return { x: d.x, z: d.z, total: 1, _first: d, resources: o, _crs: d._crs };
+      return { x: d.x, z: d.z, total: 1, _first: d, resources: o, _crs: d._crs, resource: d.resource };
     });
     _hoverThreshold = 12;
 
