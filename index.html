@@ -33,6 +33,7 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
 .filter-item .color-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.15); }
 .filter-item .name { flex: 1; color: #ccc; }
 .filter-item .count { color: #666; font-size: 10px; }
+.filter-item .level { color: #555; font-size: 10px; margin-right: 4px; }
 #toggle-all { padding: 6px 0; font-size: 11px; color: #4a90d9; cursor: pointer; text-align: center; border-top: 1px solid rgba(255,255,255,0.08); flex-shrink: 0; }
 #toggle-all:hover { background: rgba(74,144,217,0.1); }
 #mode-toggle { padding: 6px 0; font-size: 11px; color: #f39c12; cursor: pointer; text-align: center; border-top: 1px solid rgba(255,255,255,0.08); flex-shrink: 0; }
@@ -116,6 +117,7 @@ function buildClusters(spots, cellSize) {
   return [...map.values()].map(function(c) {
     c.x = c.sx / c.total;
     c.z = c.sz / c.total;
+    c._crs = gameToCRS(c.x, c.z);
     delete c.sx;
     delete c.sz;
     return c;
@@ -133,15 +135,25 @@ const PALETTE = [
   '#311b92','#003300','#bf360c','#263238'
 ];
 
-const resources = [...new Set(GATHERING_SPOTS.map(d => d.resource))].sort();
+const resourceSet = [...new Set(GATHERING_SPOTS.map(d => d.resource))];
+const levelRanges = {};
+resourceSet.forEach(function(r) { levelRanges[r] = { min: Infinity, max: -Infinity }; });
+GATHERING_SPOTS.forEach(function(d) {
+  if (d.level < levelRanges[d.resource].min) levelRanges[d.resource].min = d.level;
+  if (d.level > levelRanges[d.resource].max) levelRanges[d.resource].max = d.level;
+});
+const resources = resourceSet.sort(function(a,b) { return levelRanges[a].min - levelRanges[b].min || a.localeCompare(b); });
 resources.forEach((r, i) => {
   COLORS[r] = PALETTE[i % PALETTE.length];
-  RESOURCE_DATA[r] = { count: 0, visible: true };
+  RESOURCE_DATA[r] = { count: 0, visible: true, levelMin: levelRanges[r].min, levelMax: levelRanges[r].max };
 });
 const counts = {};
 GATHERING_SPOTS.forEach(d => { counts[d.resource] = (counts[d.resource] || 0) + 1; });
 resources.forEach(r => { RESOURCE_DATA[r].count = counts[r]; });
 document.getElementById('total-count').textContent = `${GATHERING_SPOTS.length} spots, ${resources.length} resources`;
+
+// Cache CRS coords for all spots
+GATHERING_SPOTS.forEach(function(d) { d._crs = gameToCRS(d.x, d.z); });
 
 // ---- Map ----
 const map = L.map('map', {
@@ -188,13 +200,13 @@ function drawDots() {
       // At high zoom, show individual spots instead of clusters
       _lastClusters = visible.map(function(d) {
         var o = {}; o[d.resource] = 1;
-        return { x: d.x, z: d.z, total: 1, _first: d, resources: o };
+        return { x: d.x, z: d.z, total: 1, _first: d, resources: o, _crs: d._crs };
       });
       _hoverThreshold = 12;
-      for (let i = 0, len = visible.length; i < len; i++) {
-        const d = visible[i];
+      for (let i = 0, len = _lastClusters.length; i < len; i++) {
+        const d = _lastClusters[i];
         d._radius = Math.max(3, 3.5 * Math.pow(1.35, zoom));
-        const [clng, clat] = gameToCRS(d.x, d.z);
+        const [clng, clat] = d._crs;
         const point = map.latLngToContainerPoint([clat, clng]);
         if (point.x < -10 || point.x > size.x + 10 || point.y < -10 || point.y > size.y + 10) continue;
 
@@ -234,7 +246,8 @@ function drawDots() {
 
       for (let i = 0, len = _lastClusters.length; i < len; i++) {
         const c = _lastClusters[i];
-        const [clng, clat] = gameToCRS(c.x, c.z);
+        if (!c._crs) c._crs = gameToCRS(c.x, c.z);
+        const [clng, clat] = c._crs;
         const point = map.latLngToContainerPoint([clat, clng]);
         if (point.x < -50 || point.x > size.x + 50 || point.y < -50 || point.y > size.y + 50) continue;
 
@@ -306,18 +319,18 @@ function drawDots() {
     _lastCellSize = 1;
     _lastClusters = visible.map(function(d) {
       var o = {}; o[d.resource] = 1;
-      return { x: d.x, z: d.z, total: 1, _first: d, resources: o };
+      return { x: d.x, z: d.z, total: 1, _first: d, resources: o, _crs: d._crs };
     });
     _hoverThreshold = 12;
 
-    for (let i = 0, len = visible.length; i < len; i++) {
-      const d = visible[i];
+    for (let i = 0, len = _lastClusters.length; i < len; i++) {
+      const d = _lastClusters[i];
       d._radius = Math.max(3, 3.5 * Math.pow(1.35, zoom));
-      const [clng, clat] = gameToCRS(d.x, d.z);
+      const [clng, clat] = d._crs;
       const point = map.latLngToContainerPoint([clat, clng]);
       if (point.x < -10 || point.x > size.x + 10 || point.y < -10 || point.y > size.y + 10) continue;
 
-      const radius = Math.max(3, 3.5 * Math.pow(1.35, zoom));
+      const radius = d._radius;
 
       if (zoom >= 0) {
         ctx.beginPath();
@@ -346,7 +359,13 @@ function drawDots() {
   }
 }
 
-map.on('moveend resize', drawDots);
+map.on('resize', drawDots);
+let moveRAF = null;
+map.on('move', function() {
+  if (moveRAF) return;
+  moveRAF = requestAnimationFrame(function() { moveRAF = null; drawDots(); });
+});
+map.on('moveend', drawDots);
 setTimeout(drawDots, 300);
 
 // ---- Hover tooltip ----
@@ -360,7 +379,7 @@ function setTooltipContent(e, closest) {
   tooltip.style.top = (e.containerPoint.y - 10) + 'px';
   if (closest.total === 1) {
     const d = closest._first;
-    const [clng, clat] = gameToCRS(d.x, d.z);
+    const [clng, clat] = d._crs || gameToCRS(d.x, d.z);
     tooltip.innerHTML = '<div class="tt-name">' + d.resource + ' <span style="color:#888;font-weight:400">Lv' + d.level + '</span></div><div class="tt-detail">Game: ' + d.x + ', ' + d.z + ' &middot; CRS: ' + clng.toFixed(0) + ', ' + clat.toFixed(0) + '</div>';
   } else {
     const entries = Object.entries(closest.resources).sort(function(a,b){return b[1]-a[1];});
@@ -374,7 +393,8 @@ function findClusterAt(mousePoint) {
   let closest = null, minDist = Infinity;
   for (let i = 0, len = clusters.length; i < len; i++) {
     const c = clusters[i];
-    const [clng, clat] = gameToCRS(c.x, c.z);
+    if (!c._crs) c._crs = gameToCRS(c.x, c.z);
+    const [clng, clat] = c._crs;
     const point = map.latLngToContainerPoint([clat, clng]);
     const dx = point.x - mousePoint.x, dy = point.y - mousePoint.y;
     const dist = dx * dx + dy * dy;
@@ -440,8 +460,9 @@ function buildFilterList(filterText) {
     const dot = document.createElement('span');
     dot.className = 'color-dot'; dot.style.background = COLORS[r];
     const name = document.createElement('span'); name.className = 'name'; name.textContent = r.charAt(0) + r.slice(1).toLowerCase();
+    const level = document.createElement('span'); level.className = 'level'; level.textContent = d.levelMin === d.levelMax ? 'Lv' + d.levelMin : 'Lv' + d.levelMin + '-' + d.levelMax;
     const count = document.createElement('span'); count.className = 'count'; count.textContent = d.count;
-    item.append(cb, dot, name, count);
+    item.append(cb, dot, name, level, count);
     container.appendChild(item);
   });
 }
